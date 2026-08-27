@@ -1,0 +1,32 @@
+name: Daily Stock News Digest
+
+on:
+  schedule:
+    # 01:00 UTC = 08:00 เวลาไทย (UTC+7) ทุกวัน
+    - cron: "0 1 * * *"
+  workflow_dispatch: {} # ให้กดรันเองได้จากแท็บ Actions เพื่อทดสอบ
+
+jobs:
+  send-digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run news digest
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        run: python news_digest.py
