@@ -2,8 +2,8 @@ name: Daily Stock News Digest
 
 on:
   schedule:
-    # 01:00 UTC = 08:00 เวลาไทย (UTC+7) ทุกวัน
-    - cron: "0 1 * * *"
+    # 01:07 UTC = 08:07 เวลาไทย (UTC+7) ทุกวัน (เลี่ยงต้นชั่วโมงเพื่อลดโอกาสโดน GitHub Actions queue ดีเลย์)
+    - cron: "7 1 * * *"
   workflow_dispatch: {} # ให้กดรันเองได้จากแท็บ Actions เพื่อทดสอบ
 
 jobs:
