@@ -4,8 +4,9 @@
 ขั้นตอน:
 1. ดึง RSS/Atom feed จาก sources_config.py (แยกตาม category)
 2. กรองเฉพาะรายการที่โพสต์ใน LOOKBACK_HOURS ชั่วโมงล่าสุด
-3. ส่งข้อมูลทั้งหมดให้ Gemini API สรุปเป็นภาษาไทย จัดกลุ่มตาม category
-4. ส่งอีเมลสรุปผ่าน Gmail SMTP
+3. ส่งข้อมูลทั้งหมดให้ Gemini API สรุปเป็น JSON (ภาษาไทย, แยกตาม category, ดึงตัวเลขการเงินที่ระบุตรงๆ ในข่าว)
+4. Python แปลง JSON เป็น HTML ที่จัดหน้าเป็นสัดส่วนชัดเจน (การ์ดต่อ category + กล่องสรุปตัวเลขการเงิน)
+5. ส่งอีเมลสรุปผ่าน Gmail SMTP
 
 รันด้วย: python news_digest.py
 ต้องตั้ง environment variables ก่อน (ดู README.md):
@@ -13,8 +14,11 @@
 """
 
 import calendar
+import html
+import json
 import logging
 import os
+import re
 import smtplib
 import sys
 from datetime import datetime, timedelta, timezone
@@ -24,7 +28,7 @@ from email.mime.text import MIMEText
 import feedparser
 import requests
 
-from sources_config import FEEDS, LOOKBACK_HOURS, SEC_USER_AGENT
+from sources_config import CATEGORY_META, FEEDS, LOOKBACK_HOURS, SEC_USER_AGENT
 
 # โหลดตัวแปรจากไฟล์ .env ถ้ามี (สำหรับทดสอบรันในเครื่อง) — ไม่บังคับต้องมี python-dotenv
 try:
@@ -49,6 +53,7 @@ log = logging.getLogger("news_digest")
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 REQUEST_TIMEOUT = 15  # วินาที
+DEFAULT_CATEGORY_META = {"emoji": "📰", "color": "#374151", "label_th": ""}
 
 THAI_MONTHS = [
     "", "มกราคม", "กุมภาพันธ์", "มีนาคม", "เมษายน", "พฤษภาคม", "มิถุนายน",
@@ -58,6 +63,13 @@ THAI_MONTHS = [
 
 def thai_date_str(dt: datetime) -> str:
     return f"{dt.day} {THAI_MONTHS[dt.month]} {dt.year + 543}"
+
+
+def strip_html(raw: str) -> str:
+    """ตัด HTML tag ออกจาก summary/description ของ feed แล้ว unescape entity"""
+    text = re.sub(r"<[^>]+>", " ", raw or "")
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def fetch_feed(url: str) -> feedparser.FeedParserDict:
@@ -110,6 +122,7 @@ def collect_recent_entries() -> dict[str, list[dict]]:
                 results[category].append(
                     {
                         "title": entry.get("title", "(ไม่มีหัวข้อ)"),
+                        "summary": strip_html(entry.get("summary", ""))[:400],
                         "link": entry.get("link", ""),
                         "published": dt,
                     }
@@ -129,39 +142,179 @@ def build_news_text(grouped: dict[str, list[dict]]) -> str:
         lines.append(f"## {category}")
         for item in items:
             ts = item["published"].strftime("%Y-%m-%d %H:%M UTC")
-            lines.append(f"- [{ts}] {item['title']} | link: {item['link']}")
+            lines.append(f"- [{ts}] {item['title']}")
+            if item["summary"]:
+                lines.append(f"  รายละเอียด: {item['summary']}")
+            lines.append(f"  link: {item['link']}")
         lines.append("")
     return "\n".join(lines)
 
 
-def summarize_with_gemini(news_text: str) -> str:
-    """เรียก Gemini API ให้สรุปข่าวเป็น HTML ภาษาไทย"""
+def summarize_with_gemini(news_text: str) -> dict:
+    """เรียก Gemini API ให้วิเคราะห์ข่าว คืนค่าเป็น dict (parse จาก JSON ที่ Gemini ตอบกลับ)"""
     import google.generativeai as genai
 
     api_key = os.environ["GEMINI_API_KEY"]
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(GEMINI_MODEL)
 
-    prompt = f"""คุณเป็นผู้ช่วยติดตามข่าวการลงทุน สรุปข้อมูลต่อไปนี้เป็นภาษาไทย แบบ bullet สั้นๆ อ่านเร็ว
-จัดกลุ่มตาม category (Insider & Filings, Earnings & Guidance, M&A, FDA/Pharma, Semiconductor/AI Trend)
+    category_list = "\n".join(f"- {c}" for c in FEEDS)
 
-สำหรับแต่ละรายการ ให้ระบุ:
-- เกิดอะไรขึ้น (สรุปสั้น)
-- ทำไมอาจสำคัญต่อการลงทุน (ถ้าไม่ชัดเจนให้บอกตรงๆ ว่า 'ยังไม่ชัดเจนว่ากระทบอย่างไร' แทนที่จะเดา)
-- ใส่ลิงก์กำกับท้ายแต่ละข่าว
+    prompt = f"""คุณเป็นผู้ช่วยติดตามข่าวการลงทุน วิเคราะห์ข้อมูลข่าวด้านล่าง แล้วตอบกลับเป็น JSON เท่านั้น
+(ห้ามมี markdown code fence เช่น ```json ห้ามมีข้อความอื่นใดนอก JSON)
 
-หมายเหตุ: อย่าตีความเกินจากข้อมูลที่มี อย่าฟันธงว่าราคาหุ้นจะขึ้นหรือลง แค่รายงานข้อเท็จจริงและความสำคัญเชิงข่าว
+โครงสร้าง JSON ที่ต้องการเป๊ะๆ:
+{{
+  "categories": {{
+    "<ชื่อ category ต้องตรงกับที่ให้มาด้านล่างเป๊ะๆ ตัวอักษรต่อตัวอักษร>": [
+      {{
+        "headline": "สรุปสั้นๆ ว่าเกิดอะไรขึ้น (ภาษาไทย 1 ประโยค)",
+        "why_matters": "ทำไมอาจสำคัญต่อการลงทุน ถ้าไม่ชัดเจนให้เขียนตรงๆ ว่า 'ยังไม่ชัดเจนว่ากระทบอย่างไร' ห้ามเดา",
+        "numbers": ["ตัวเลขการเงินที่ระบุไว้ตรงๆ ในข่าวเท่านั้น เช่น 'รายได้ 35.1 พันล้านดอลลาร์ (+94% YoY)', 'EPS 1.05 ดอลลาร์ เทียบคาดการณ์ 0.98 ดอลลาร์', 'มูลค่าดีล 2 หมื่นล้านดอลลาร์'"],
+        "link": "ลิงก์ข่าวเดิม คัดลอกมาตรงๆ จากข้อมูลด้านล่าง"
+      }}
+    ]
+  }}
+}}
 
-รูปแบบผลลัพธ์: ตอบเป็น HTML fragment เท่านั้น (ห้ามมี <html>, <head>, <body>)
-ใช้ <h2> สำหรับชื่อ category, <ul>/<li> สำหรับแต่ละข่าว, <a href="...">ลิงก์</a> สำหรับลิงก์
-ถ้า category ไหนไม่มีข่าว ให้ข้าม category นั้นไปเลย
+กติกาสำคัญ:
+1. category ต้องเป็นหนึ่งใน:
+{category_list}
+   ใช้เฉพาะ category ที่มีข่าวจริงเท่านั้น ข้ามอันที่ไม่มีข่าวไปเลย ห้ามสร้าง category ใหม่
+2. "numbers" ใส่เฉพาะตัวเลขการเงิน/ผลประกอบการที่ปรากฏตรงๆ ในข้อมูลข่าวเท่านั้น
+   (รายได้, กำไร/ขาดทุนสุทธิ, EPS, % เติบโต YoY/QoQ, มูลค่าดีล, guidance, ผลทดลองยา %, ราคาเป้าหมาย)
+   ถ้าข่าวไม่มีตัวเลขระบุไว้ ให้ใส่ list ว่าง [] ห้ามประมาณ/เดา/คำนวณตัวเลขขึ้นเองเด็ดขาด
+3. อย่าตีความเกินจากข้อมูลที่มี อย่าฟันธงว่าราคาหุ้นจะขึ้นหรือลง แค่รายงานข้อเท็จจริงและความสำคัญเชิงข่าว
+4. link ต้อง copy มาจากข้อมูลด้านล่างตรงๆ ห้ามแต่งขึ้นเอง
 
-ข้อมูล:
+ข้อมูลข่าว:
 {news_text}
 """
 
-    response = model.generate_content(prompt)
-    return response.text
+    response = model.generate_content(
+        prompt,
+        generation_config=genai.types.GenerationConfig(response_mime_type="application/json"),
+    )
+    return json.loads(response.text)
+
+
+def esc(text: str) -> str:
+    return html.escape(text or "", quote=True)
+
+
+def safe_link(url: str) -> str:
+    url = (url or "").strip()
+    if url.startswith("http://") or url.startswith("https://"):
+        return esc(url)
+    return "#"
+
+
+def render_numbers_chips(numbers: list[str]) -> str:
+    if not numbers:
+        return ""
+    chips = "".join(
+        f'<span style="display:inline-block;background:#fffbeb;border:1px solid #fde68a;'
+        f'color:#92400e;border-radius:6px;padding:2px 8px;margin:2px 6px 2px 0;font-size:12px;">'
+        f"💰 {esc(n)}</span>"
+        for n in numbers
+        if n
+    )
+    return f'<div style="margin-top:4px;">{chips}</div>' if chips else ""
+
+
+def render_digest_html(data: dict) -> str:
+    """แปลง dict ที่ได้จาก Gemini (JSON) เป็น HTML: กล่องสรุปตัวเลขการเงิน + การ์ดตาม category"""
+    categories = data.get("categories") or {}
+    known_order = list(FEEDS)
+    extra_order = [c for c in categories if c not in known_order]
+    ordered_categories = known_order + extra_order
+
+    highlight_rows: list[str] = []
+    section_html: list[str] = []
+
+    for category in ordered_categories:
+        items = categories.get(category) or []
+        if not items:
+            continue
+        meta = {**DEFAULT_CATEGORY_META, **CATEGORY_META.get(category, {"label_th": category})}
+        label = meta["label_th"] or category
+
+        item_html = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            headline = esc(item.get("headline", ""))
+            why = esc(item.get("why_matters", ""))
+            link = safe_link(item.get("link", ""))
+            numbers = [n for n in (item.get("numbers") or []) if isinstance(n, str) and n.strip()]
+
+            if numbers:
+                highlight_rows.append(
+                    f'<li style="margin-bottom:6px;">{meta["emoji"]} <b>{headline}</b> — '
+                    + " | ".join(esc(n) for n in numbers)
+                    + "</li>"
+                )
+
+            item_html.append(
+                f'<li style="margin-bottom:14px;">'
+                f'<div style="font-weight:600;">{headline}</div>'
+                f'<div style="color:#4b5563;font-size:13px;margin-top:2px;">{why}</div>'
+                f"{render_numbers_chips(numbers)}"
+                f'<div style="margin-top:4px;"><a href="{link}" style="font-size:12px;color:{meta["color"]};">อ่านข่าวเต็ม →</a></div>'
+                f"</li>"
+            )
+
+        if not item_html:
+            continue
+
+        section_html.append(
+            f'<div style="border-left:4px solid {meta["color"]};background:#f9fafb;'
+            f'border-radius:8px;padding:12px 16px;margin-bottom:16px;">'
+            f'<h2 style="font-size:16px;margin:0 0 8px 0;color:{meta["color"]};">{meta["emoji"]} {esc(label)}</h2>'
+            f'<ul style="margin:0;padding-left:18px;">{"".join(item_html)}</ul>'
+            f"</div>"
+        )
+
+    if highlight_rows:
+        highlight_box = (
+            '<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;'
+            'padding:12px 16px;margin-bottom:20px;">'
+            '<h2 style="font-size:16px;margin:0 0 8px 0;color:#92400e;">🧮 ตัวเลขการเงินสำคัญวันนี้</h2>'
+            f'<ul style="margin:0;padding-left:18px;font-size:13px;color:#78350f;">{"".join(highlight_rows[:10])}</ul>'
+            "</div>"
+        )
+    else:
+        highlight_box = (
+            '<div style="background:#f3f4f6;border-radius:8px;padding:12px 16px;'
+            'margin-bottom:20px;font-size:13px;color:#6b7280;">'
+            "🧮 วันนี้ไม่มีตัวเลขการเงินที่ระบุชัดเจนในข่าวที่ติดตาม"
+            "</div>"
+        )
+
+    if not section_html:
+        return highlight_box + "<p>วันนี้ไม่มีข่าวสำคัญจากแหล่งข้อมูลที่ติดตามใน 24 ชั่วโมงที่ผ่านมา</p>"
+
+    return highlight_box + "".join(section_html)
+
+
+def render_fallback_html(grouped: dict[str, list[dict]]) -> str:
+    """ใช้ตอน Gemini เรียกไม่สำเร็จ หรือ parse JSON ไม่ได้ — แสดงหัวข้อข่าวดิบแต่จัดหน้าแบบเดียวกับปกติ"""
+    lines = ['<p><i>(สรุปด้วย AI ไม่สำเร็จ แสดงหัวข้อข่าวดิบแทน — ไม่มีตัวเลขการเงินสรุปให้ในกรณีนี้)</i></p>']
+    for category, items in grouped.items():
+        if not items:
+            continue
+        meta = {**DEFAULT_CATEGORY_META, **CATEGORY_META.get(category, {"label_th": category})}
+        label = meta["label_th"] or category
+        lines.append(
+            f'<div style="border-left:4px solid {meta["color"]};background:#f9fafb;'
+            f'border-radius:8px;padding:12px 16px;margin-bottom:16px;">'
+            f'<h2 style="font-size:16px;margin:0 0 8px 0;color:{meta["color"]};">{meta["emoji"]} {esc(label)}</h2><ul>'
+        )
+        for item in items:
+            link = safe_link(item["link"])
+            lines.append(f'<li><a href="{link}">{esc(item["title"])}</a></li>')
+        lines.append("</ul></div>")
+    return "\n".join(lines)
 
 
 def build_email_html(body_html: str, date_str: str) -> str:
@@ -219,20 +372,11 @@ def main() -> None:
     news_text = build_news_text(grouped)
 
     try:
-        summary_html = summarize_with_gemini(news_text)
-    except Exception as exc:  # noqa: BLE001 - ถ้า Gemini ล่ม ให้ส่งข่าวดิบแทน ดีกว่าไม่ส่งอะไรเลย
-        log.error("เรียก Gemini API ไม่สำเร็จ ใช้รายการข่าวดิบแทน: %s", exc)
-        fallback_lines = ["<p><i>(สรุปด้วย AI ไม่สำเร็จ แสดงหัวข้อข่าวดิบแทน)</i></p>"]
-        for category, items in grouped.items():
-            if not items:
-                continue
-            fallback_lines.append(f"<h2>{category}</h2><ul>")
-            for item in items:
-                fallback_lines.append(
-                    f'<li><a href="{item["link"]}">{item["title"]}</a></li>'
-                )
-            fallback_lines.append("</ul>")
-        summary_html = "\n".join(fallback_lines)
+        data = summarize_with_gemini(news_text)
+        summary_html = render_digest_html(data)
+    except Exception as exc:  # noqa: BLE001 - ถ้า Gemini/JSON ล่ม ให้ส่งข่าวดิบแทน ดีกว่าไม่ส่งอะไรเลย
+        log.error("เรียก Gemini API หรือ parse ผลลัพธ์ไม่สำเร็จ ใช้รายการข่าวดิบแทน: %s", exc)
+        summary_html = render_fallback_html(grouped)
 
     send_email(subject, build_email_html(summary_html, date_str))
     log.info("=== จบการทำงาน ===")

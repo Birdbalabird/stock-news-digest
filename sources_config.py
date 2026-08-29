@@ -22,6 +22,36 @@ SEC_USER_AGENT = "c.kiattipon@gmail.com"
 # ดึงข่าวย้อนหลังกี่ชั่วโมง (ตามโจทย์ = 24 ชม.)
 LOOKBACK_HOURS = 24
 
+# emoji/สี/ชื่อภาษาไทยของแต่ละ category ตอนจัดหน้าอีเมล — key ต้องตรงกับ FEEDS ทุกตัว
+# (ถ้าเพิ่ม category ใหม่ใน FEEDS แล้วไม่ได้เพิ่มที่นี่ด้วย จะยังแสดงผลได้ปกติ แค่ใช้ emoji/สี default แทน)
+CATEGORY_META = {
+    "Insider & Filings": {
+        "emoji": "🏛️",
+        "color": "#4f46e5",
+        "label_th": "Insider & Filings (ผู้บริหารซื้อขายหุ้น/แบบยื่น)",
+    },
+    "Earnings & Guidance": {
+        "emoji": "📊",
+        "color": "#2563eb",
+        "label_th": "Earnings & Guidance (ผลประกอบการ)",
+    },
+    "M&A / Deal Rumors": {
+        "emoji": "🤝",
+        "color": "#7c3aed",
+        "label_th": "M&A / Deal Rumors (ควบรวม/ข่าวลือดีล)",
+    },
+    "FDA / Pharma Catalyst": {
+        "emoji": "💊",
+        "color": "#db2777",
+        "label_th": "FDA / Pharma Catalyst (ข่าวยา/อนุมัติ)",
+    },
+    "Semiconductor / AI Infra Trend": {
+        "emoji": "🧠",
+        "color": "#059669",
+        "label_th": "Semiconductor / AI Infra Trend (เซมิคอนดักเตอร์/AI)",
+    },
+}
+
 FEEDS = {
     "Insider & Filings": [
         # 8-K = material events, Form 4 = insider buy/sell
